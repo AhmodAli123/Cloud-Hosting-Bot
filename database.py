@@ -45,6 +45,45 @@ def init_db():
             value TEXT
         );
         INSERT OR IGNORE INTO settings(key, value) VALUES ('maintenance', '0');
+
+        CREATE TABLE IF NOT EXISTS coupons (
+            code        TEXT PRIMARY KEY,
+            plan        TEXT DEFAULT 'premium',
+            days        INTEGER DEFAULT 30,
+            max_uses    INTEGER DEFAULT 1,
+            used_count  INTEGER DEFAULT 0,
+            created_at  REAL,
+            expires_at  REAL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS coupon_uses (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            code        TEXT,
+            user_id     INTEGER,
+            used_at     REAL
+        );
+        CREATE TABLE IF NOT EXISTS cron_jobs (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id     INTEGER,
+            filename    TEXT,
+            cron_expr   TEXT,
+            enabled     INTEGER DEFAULT 1,
+            last_run    REAL DEFAULT 0,
+            created_at  REAL
+        );
+        CREATE TABLE IF NOT EXISTS env_vars (
+            user_id     INTEGER,
+            filename    TEXT,
+            env_key     TEXT,
+            env_value   TEXT,
+            PRIMARY KEY (user_id, filename, env_key)
+        );
+        CREATE TABLE IF NOT EXISTS user_settings (
+            user_id         INTEGER PRIMARY KEY,
+            auto_restart    INTEGER DEFAULT 0,
+            crash_notify    INTEGER DEFAULT 1,
+            cpu_limit       REAL DEFAULT 80.0,
+            ram_limit_mb    REAL DEFAULT 256.0
+        );
     """)
     conn.commit()
     conn.close()
@@ -190,3 +229,132 @@ def _sync_json():
         json.dump(users, f, indent=2, default=str)
 
 init_db()
+
+# ── Coupon System ─────────────────────────────────────────────────────────────
+def create_coupon(code, plan="premium", days=30, max_uses=1, expires_days=0):
+    conn = get_conn()
+    now = time.time()
+    expires_at = now + expires_days * 86400 if expires_days > 0 else 0
+    try:
+        conn.execute(
+            "INSERT INTO coupons(code,plan,days,max_uses,used_count,created_at,expires_at) VALUES(?,?,?,?,0,?,?)",
+            (code.upper(), plan, days, max_uses, now, expires_at)
+        )
+        conn.commit()
+        return True, "✅ Coupon created"
+    except:
+        return False, "❌ Coupon already exists"
+    finally:
+        conn.close()
+
+def redeem_coupon(code, user_id):
+    conn = get_conn()
+    try:
+        row = conn.execute("SELECT * FROM coupons WHERE code=?", (code.upper(),)).fetchone()
+        if not row:
+            return False, "❌ Invalid coupon code"
+        row = dict(row)
+        if row["expires_at"] > 0 and time.time() > row["expires_at"]:
+            return False, "❌ Coupon has expired"
+        if row["used_count"] >= row["max_uses"]:
+            return False, "❌ Coupon has been fully used"
+        already = conn.execute("SELECT id FROM coupon_uses WHERE code=? AND user_id=?", (code.upper(), user_id)).fetchone()
+        if already:
+            return False, "❌ You already used this coupon"
+        conn.execute("UPDATE coupons SET used_count=used_count+1 WHERE code=?", (code.upper(),))
+        conn.execute("INSERT INTO coupon_uses(code,user_id,used_at) VALUES(?,?,?)", (code.upper(), user_id, time.time()))
+        conn.commit()
+        return True, {"plan": row["plan"], "days": row["days"]}
+    finally:
+        conn.close()
+
+def get_all_coupons():
+    conn = get_conn()
+    rows = conn.execute("SELECT * FROM coupons ORDER BY created_at DESC").fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+def delete_coupon(code):
+    conn = get_conn()
+    conn.execute("DELETE FROM coupons WHERE code=?", (code.upper(),))
+    conn.commit()
+    conn.close()
+
+# ── Cron Jobs ─────────────────────────────────────────────────────────────────
+def add_cron_job(user_id, filename, cron_expr):
+    conn = get_conn()
+    existing = conn.execute("SELECT id FROM cron_jobs WHERE user_id=? AND filename=?", (user_id, filename)).fetchone()
+    if existing:
+        conn.execute("UPDATE cron_jobs SET cron_expr=?,enabled=1 WHERE user_id=? AND filename=?", (cron_expr, user_id, filename))
+    else:
+        conn.execute("INSERT INTO cron_jobs(user_id,filename,cron_expr,enabled,last_run,created_at) VALUES(?,?,?,1,0,?)", (user_id, filename, cron_expr, time.time()))
+    conn.commit()
+    conn.close()
+
+def remove_cron_job(user_id, filename):
+    conn = get_conn()
+    conn.execute("DELETE FROM cron_jobs WHERE user_id=? AND filename=?", (user_id, filename))
+    conn.commit()
+    conn.close()
+
+def get_user_cron_jobs(user_id):
+    conn = get_conn()
+    rows = conn.execute("SELECT * FROM cron_jobs WHERE user_id=?", (user_id,)).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+def get_all_cron_jobs():
+    conn = get_conn()
+    rows = conn.execute("SELECT * FROM cron_jobs WHERE enabled=1").fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+def update_cron_last_run(job_id):
+    conn = get_conn()
+    conn.execute("UPDATE cron_jobs SET last_run=? WHERE id=?", (time.time(), job_id))
+    conn.commit()
+    conn.close()
+
+# ── Env Vars ──────────────────────────────────────────────────────────────────
+def set_env_var(user_id, filename, key, value):
+    conn = get_conn()
+    conn.execute("INSERT OR REPLACE INTO env_vars(user_id,filename,env_key,env_value) VALUES(?,?,?,?)", (user_id, filename, key, value))
+    conn.commit()
+    conn.close()
+
+def get_env_vars(user_id, filename):
+    conn = get_conn()
+    rows = conn.execute("SELECT env_key,env_value FROM env_vars WHERE user_id=? AND filename=?", (user_id, filename)).fetchall()
+    conn.close()
+    return {r["env_key"]: r["env_value"] for r in rows}
+
+def delete_env_var(user_id, filename, key):
+    conn = get_conn()
+    conn.execute("DELETE FROM env_vars WHERE user_id=? AND filename=? AND env_key=?", (user_id, filename, key))
+    conn.commit()
+    conn.close()
+
+def delete_all_env_vars(user_id, filename):
+    conn = get_conn()
+    conn.execute("DELETE FROM env_vars WHERE user_id=? AND filename=?", (user_id, filename))
+    conn.commit()
+    conn.close()
+
+# ── User Settings ─────────────────────────────────────────────────────────────
+def get_user_settings(user_id):
+    conn = get_conn()
+    row = conn.execute("SELECT * FROM user_settings WHERE user_id=?", (user_id,)).fetchone()
+    conn.close()
+    if row:
+        return dict(row)
+    return {"user_id": user_id, "auto_restart": 0, "crash_notify": 1, "cpu_limit": 80.0, "ram_limit_mb": 256.0}
+
+def update_user_settings(user_id, **kwargs):
+    current = get_user_settings(user_id)
+    current.update(kwargs)
+    conn = get_conn()
+    conn.execute("""INSERT OR REPLACE INTO user_settings(user_id,auto_restart,crash_notify,cpu_limit,ram_limit_mb)
+                    VALUES(?,?,?,?,?)""",
+                 (user_id, current["auto_restart"], current["crash_notify"], current["cpu_limit"], current["ram_limit_mb"]))
+    conn.commit()
+    conn.close()

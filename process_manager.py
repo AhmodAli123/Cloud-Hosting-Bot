@@ -49,7 +49,7 @@ def is_running(user_id, filename):
         proc = _processes[key].get("proc")
         return proc is not None and proc.poll() is None
 
-def run_script(user_id, filename, plan="free", auto_restart=False):
+def run_script(user_id, filename, plan="free", auto_restart=False, bot_ref=None):
     if get_user_process_count(user_id) >= _get_max_processes(plan):
         return False, f"❌ Process limit reached ({_get_max_processes(plan)} max for {plan} plan)"
 
@@ -71,6 +71,15 @@ def run_script(user_id, filename, plan="free", auto_restart=False):
     else:
         return False, "❌ Unsupported file type"
 
+    # Load env vars from database
+    try:
+        from database import get_env_vars
+        env_vars = get_env_vars(user_id, filename)
+        env = os.environ.copy()
+        env.update(env_vars)
+    except Exception:
+        env = os.environ.copy()
+
     try:
         log_file = open(log_path, "a")
         proc = subprocess.Popen(
@@ -79,6 +88,7 @@ def run_script(user_id, filename, plan="free", auto_restart=False):
             stderr=log_file,
             cwd=user_dir,
             preexec_fn=os.setsid,
+            env=env,
         )
         with _process_lock:
             _processes[(user_id, filename)] = {
@@ -89,6 +99,7 @@ def run_script(user_id, filename, plan="free", auto_restart=False):
                 "log_file": log_file,
                 "filename": filename,
                 "auto_restart": auto_restart,
+                "bot_ref": bot_ref,
             }
         _auto_restart_flags[(user_id, filename)] = auto_restart
 
@@ -109,14 +120,37 @@ def _monitor_process(user_id, filename, plan):
                 break
             proc = _processes[key]["proc"]
             log_file = _processes[key]["log_file"]
+            auto_restart = _processes[key].get("auto_restart", False)
+            bot_ref = _processes[key].get("bot_ref", None)
         if proc.poll() is not None:
             log_file.close()
-            auto_restart = _auto_restart_flags.get(key, False)
             with _process_lock:
                 _processes.pop(key, None)
+            # Crash notification
+            try:
+                from database import get_user_settings
+                settings = get_user_settings(user_id)
+                if settings.get("crash_notify", 1) and bot_ref:
+                    from log_manager import detect_error_in_log
+                    import os as _os
+                    from config import LOGS_DIR
+                    log_path = _os.path.join(LOGS_DIR, f"{user_id}_{filename}.log")
+                    error_hint = detect_error_in_log(user_id, filename)
+                    msg = (
+                        f"⚠️ <b>Script Crashed!</b>\n"
+                        f"📄 File: <code>{filename}</code>\n"
+                        f"🕐 Runtime: {int(time.time()-start)}s"
+                    )
+                    if error_hint:
+                        msg += f"\n\n🔴 <b>Error:</b>\n<pre>{error_hint[:400]}</pre>"
+                    if auto_restart:
+                        msg += "\n\n♻️ <b>Auto-restart enabled, restarting in 5s...</b>"
+                    bot_ref.send_message(user_id, msg)
+            except Exception:
+                pass
             if auto_restart:
                 time.sleep(5)
-                run_script(user_id, filename, plan, auto_restart=True)
+                run_script(user_id, filename, plan, auto_restart=True, bot_ref=bot_ref)
             break
         elapsed = time.time() - start
         if elapsed > SCRIPT_TIMEOUT:

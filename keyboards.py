@@ -13,30 +13,12 @@ def main_menu_keyboard(is_admin=False):
         KeyboardButton("📊 My Stats"),
         KeyboardButton("📜 Logs"),
         KeyboardButton("ℹ️ Status"),
+        KeyboardButton("⚙️ Settings"),
+        KeyboardButton("🎫 Redeem"),
     )
     if is_admin:
         markup.add(KeyboardButton("🔐 Admin Panel"))
     markup.add(KeyboardButton("❓ Help"))
-    return markup
-
-def admin_panel_keyboard():
-    markup = InlineKeyboardMarkup(row_width=2)
-    markup.add(
-        InlineKeyboardButton("👥 All Users", callback_data="admin_users"),
-        InlineKeyboardButton("📊 Global Stats", callback_data="admin_stats"),
-        InlineKeyboardButton("➕ Add Premium", callback_data="admin_add_premium"),
-        InlineKeyboardButton("➖ Remove Premium", callback_data="admin_remove_premium"),
-        InlineKeyboardButton("🚫 Ban User", callback_data="admin_ban"),
-        InlineKeyboardButton("✅ Unban User", callback_data="admin_unban"),
-        InlineKeyboardButton("📢 Broadcast", callback_data="admin_broadcast"),
-        InlineKeyboardButton("🔒 Maintenance ON", callback_data="admin_maintenance_on"),
-        InlineKeyboardButton("🔓 Maintenance OFF", callback_data="admin_maintenance_off"),
-        InlineKeyboardButton("🧹 Clear All Logs", callback_data="admin_clear_logs"),
-        InlineKeyboardButton("💀 Stop All Scripts", callback_data="admin_stop_all"),
-        InlineKeyboardButton("🖥️ Shell Command", callback_data="admin_shell"),
-        InlineKeyboardButton("🔄 Restart Bot", callback_data="admin_restart"),
-        InlineKeyboardButton("📦 System Info", callback_data="admin_sysinfo"),
-    )
     return markup
 
 def file_list_keyboard(files, running_files=None, page=0, page_size=5):
@@ -63,22 +45,27 @@ def file_list_keyboard(files, running_files=None, page=0, page_size=5):
     markup.add(InlineKeyboardButton("🔙 Back", callback_data="back_main"))
     return markup
 
-def file_action_keyboard(filename, is_running=False):
+def file_action_keyboard(filename, is_running=False, auto_restart=False):
     markup = InlineKeyboardMarkup(row_width=2)
     if is_running:
         markup.add(
             InlineKeyboardButton("🛑 Stop", callback_data=f"stop:{filename}"),
             InlineKeyboardButton("📜 View Log", callback_data=f"viewlog:{filename}"),
-            InlineKeyboardButton("🔁 Auto Restart ON", callback_data=f"autorestart:{filename}"),
         )
+        ar_label = "♻️ Auto-Restart: ON" if auto_restart else "♻️ Auto-Restart: OFF"
+        markup.add(InlineKeyboardButton(ar_label, callback_data=f"toggle_ar:{filename}"))
     else:
         markup.add(
             InlineKeyboardButton("▶️ Run", callback_data=f"run:{filename}"),
             InlineKeyboardButton("🔁 Retry Run", callback_data=f"retryrun:{filename}"),
             InlineKeyboardButton("📜 View Log", callback_data=f"viewlog:{filename}"),
-            InlineKeyboardButton("✏️ Edit", callback_data=f"edit:{filename}"),
+            InlineKeyboardButton("✏️ Edit Code", callback_data=f"edit:{filename}"),
+            InlineKeyboardButton("🌍 Env Vars", callback_data=f"env_menu:{filename}"),
+            InlineKeyboardButton("⏰ Schedule", callback_data=f"cron_menu:{filename}"),
             InlineKeyboardButton("🗑️ Delete", callback_data=f"delete:{filename}"),
         )
+        ar_label = "♻️ Auto-Restart: ON" if auto_restart else "♻️ Auto-Restart: OFF"
+        markup.add(InlineKeyboardButton(ar_label, callback_data=f"toggle_ar:{filename}"))
     markup.add(InlineKeyboardButton("🔙 Back", callback_data="back_files"))
     return markup
 
@@ -147,3 +134,63 @@ def user_list_keyboard(users, page=0, page_size=8):
 
 def remove_keyboard():
     return ReplyKeyboardRemove()
+
+def env_menu_keyboard(filename, env_vars):
+    markup = InlineKeyboardMarkup(row_width=1)
+    for k, v in list(env_vars.items())[:10]:
+        display = f"🔑 {k} = {v[:20]}{'...' if len(v)>20 else ''}"
+        markup.add(InlineKeyboardButton(display, callback_data=f"env_del:{filename}:{k}"))
+    markup.add(
+        InlineKeyboardButton("➕ Add Variable", callback_data=f"env_add:{filename}"),
+        InlineKeyboardButton("🗑️ Clear All", callback_data=f"env_clear:{filename}"),
+        InlineKeyboardButton("🔙 Back", callback_data=f"file_menu:{filename}"),
+    )
+    return markup
+
+def cron_menu_keyboard(filename, cron_job=None):
+    markup = InlineKeyboardMarkup(row_width=2)
+    if cron_job:
+        markup.add(
+            InlineKeyboardButton("🗑️ Remove Schedule", callback_data=f"cron_remove:{filename}"),
+            InlineKeyboardButton("✏️ Change Time", callback_data=f"cron_add:{filename}"),
+        )
+    else:
+        markup.add(
+            InlineKeyboardButton("⏰ Set Daily (09:00)", callback_data=f"cron_set:{filename}:0 9 * * *"),
+            InlineKeyboardButton("⏰ Set Hourly", callback_data=f"cron_set:{filename}:0 * * * *"),
+            InlineKeyboardButton("⏰ Custom Time", callback_data=f"cron_add:{filename}"),
+        )
+    markup.add(InlineKeyboardButton("🔙 Back", callback_data=f"file_menu:{filename}"))
+    return markup
+
+def admin_panel_keyboard():
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        InlineKeyboardButton("👥 All Users", callback_data="admin_users"),
+        InlineKeyboardButton("📊 Global Stats", callback_data="admin_stats"),
+        InlineKeyboardButton("➕ Add Premium", callback_data="admin_add_premium"),
+        InlineKeyboardButton("➖ Remove Premium", callback_data="admin_remove_premium"),
+        InlineKeyboardButton("🚫 Ban User", callback_data="admin_ban"),
+        InlineKeyboardButton("✅ Unban User", callback_data="admin_unban"),
+        InlineKeyboardButton("📢 Broadcast", callback_data="admin_broadcast"),
+        InlineKeyboardButton("🎫 Coupons", callback_data="admin_coupons"),
+        InlineKeyboardButton("🔒 Maintenance ON", callback_data="admin_maintenance_on"),
+        InlineKeyboardButton("🔓 Maintenance OFF", callback_data="admin_maintenance_off"),
+        InlineKeyboardButton("🧹 Clear All Logs", callback_data="admin_clear_logs"),
+        InlineKeyboardButton("💀 Stop All Scripts", callback_data="admin_stop_all"),
+        InlineKeyboardButton("🖥️ Shell Command", callback_data="admin_shell"),
+        InlineKeyboardButton("🔄 Restart Bot", callback_data="admin_restart"),
+        InlineKeyboardButton("📦 System Info", callback_data="admin_sysinfo"),
+    )
+    return markup
+
+def coupon_list_keyboard(coupons):
+    markup = InlineKeyboardMarkup(row_width=1)
+    for c in coupons[:10]:
+        label = f"🎫 {c['code']} | {c['plan']} {c['days']}d | {c['used_count']}/{c['max_uses']}"
+        markup.add(InlineKeyboardButton(label, callback_data=f"coupon_del:{c['code']}"))
+    markup.add(
+        InlineKeyboardButton("➕ Create Coupon", callback_data="coupon_create"),
+        InlineKeyboardButton("🔙 Admin Panel", callback_data="back_admin"),
+    )
+    return markup

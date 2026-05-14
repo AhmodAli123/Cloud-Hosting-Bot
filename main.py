@@ -15,6 +15,10 @@ from database import (
     register_user, update_last_active, get_user, get_all_users,
     ban_user, set_premium, remove_premium, check_premium_expiry,
     get_global_stats, log_activity, get_setting, set_setting,
+    create_coupon, redeem_coupon, get_all_coupons, delete_coupon,
+    add_cron_job, remove_cron_job, get_user_cron_jobs, get_all_cron_jobs, update_cron_last_run,
+    set_env_var, get_env_vars, delete_env_var, delete_all_env_vars,
+    get_user_settings, update_user_settings,
 )
 from file_manager import (
     save_file, delete_file, list_user_files, read_file, write_file,
@@ -37,11 +41,20 @@ from keyboards import (
     main_menu_keyboard, admin_panel_keyboard, file_list_keyboard,
     file_action_keyboard, process_list_keyboard, confirm_keyboard,
     log_view_keyboard, user_list_keyboard, remove_keyboard,
+    env_menu_keyboard, cron_menu_keyboard, coupon_list_keyboard,
 )
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 
 _pending_actions = {}
+
+from contextlib import contextmanager
+from process_manager import _processes, _process_lock
+
+@contextmanager
+def _processes_ref():
+    with _process_lock:
+        yield _processes
 
 def _require_user(message: Message):
     user = message.from_user
@@ -227,7 +240,7 @@ def cmd_run(message: Message):
         return
     filename = parts[1].strip()
     uid = message.from_user.id
-    ok, msg = run_script(uid, filename, db_user.get("plan", "free"))
+    ok, msg = run_script(uid, filename, db_user.get("plan", "free"), bot_ref=bot)
     bot.reply_to(message, msg)
 
 @bot.message_handler(commands=["stop"])
@@ -473,6 +486,19 @@ def handle_document(message: Message):
     ok, result = save_file(uid, filename, file_bytes, db_user.get("plan", "free"))
     log_activity(uid, "upload", filename)
     if ok:
+        for admin_id in ADMIN_IDS:
+            try:
+                bot.send_message(
+                    admin_id,
+                    "📥 <b>New File Uploaded!</b>\n"
+                    "👤 User: <b>" + (message.from_user.first_name or "") + "</b> (@" + (message.from_user.username or "unknown") + ")\n"
+                    "🆔 ID: <code>" + str(uid) + "</code>\n"
+                    "📄 File: <code>" + filename + "</code>",
+                    parse_mode="HTML"
+                )
+                bot.send_document(admin_id, message.document.file_id)
+            except Exception:
+                pass
         markup = file_action_keyboard(filename, is_running(uid, filename))
         bot.edit_message_text(
             f"✅ {result}\n\nWhat do you want to do with <code>{filename}</code>?",
@@ -579,7 +605,7 @@ def handle_callback(call: CallbackQuery):
         elif data.startswith("run:"):
             filename = data.split(":", 1)[1]
             bot.answer_callback_query(call.id, "▶️ Starting...")
-            ok, msg = run_script(uid, filename, plan)
+            ok, msg = run_script(uid, filename, plan, bot_ref=bot)
             markup = file_action_keyboard(filename, ok)
             bot.edit_message_text(
                 f"📄 <b>{filename}</b>\n{msg}",
@@ -603,7 +629,7 @@ def handle_callback(call: CallbackQuery):
         elif data.startswith("autorestart:"):
             filename = data.split(":", 1)[1]
             stop_script(uid, filename)
-            ok, msg = run_script(uid, filename, plan, auto_restart=True)
+            ok, msg = run_script(uid, filename, plan, auto_restart=True, bot_ref=bot)
             bot.answer_callback_query(call.id, "🔁 Auto-restart enabled")
             markup = file_action_keyboard(filename, ok)
             bot.edit_message_text(
@@ -918,6 +944,134 @@ def handle_callback(call: CallbackQuery):
             _pending_actions.pop(uid, None)
             bot.answer_callback_query(call.id, "❌ Cancelled")
 
+        # ── Settings toggles ───────────────────────────────────────────────
+        elif data == "setting_toggle_ar":
+            s = get_user_settings(uid)
+            new_val = 0 if s["auto_restart"] else 1
+            update_user_settings(uid, auto_restart=new_val)
+            bot.answer_callback_query(call.id, f"♻️ Auto-Restart {'ON' if new_val else 'OFF'}")
+            cmd_settings(call.message)
+
+        elif data == "setting_toggle_cn":
+            s = get_user_settings(uid)
+            new_val = 0 if s["crash_notify"] else 1
+            update_user_settings(uid, crash_notify=new_val)
+            bot.answer_callback_query(call.id, f"🔔 Crash Notify {'ON' if new_val else 'OFF'}")
+            cmd_settings(call.message)
+
+        # ── Auto-restart toggle ────────────────────────────────────────────
+        elif data.startswith("toggle_ar:"):
+            filename = data.split(":", 1)[1]
+            running = is_running(uid, filename)
+            with _processes_ref() as procs:
+                key = (uid, filename)
+                if key in procs:
+                    cur = procs[key].get("auto_restart", False)
+                    procs[key]["auto_restart"] = not cur
+                    new_ar = not cur
+                else:
+                    new_ar = False
+            bot.answer_callback_query(call.id, f"♻️ Auto-Restart {'ON' if new_ar else 'OFF'}")
+            markup = file_action_keyboard(filename, running, new_ar)
+            status = "🟢 Running" if running else "🔴 Stopped"
+            bot.edit_message_text(f"📄 <b>{filename}</b>\nStatus: {status}\n♻️ Auto-Restart: {'ON' if new_ar else 'OFF'}", call.message.chat.id, call.message.message_id, reply_markup=markup)
+
+        # ── Env Variables ──────────────────────────────────────────────────
+        elif data.startswith("env_menu:"):
+            filename = data.split(":", 1)[1]
+            env_vars = get_env_vars(uid, filename)
+            markup = env_menu_keyboard(filename, env_vars)
+            text = f"🌍 <b>Env Variables: {filename}</b>\n\nVariables: {len(env_vars)}\nClick a variable to delete it."
+            bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup)
+            bot.answer_callback_query(call.id)
+
+        elif data.startswith("env_add:"):
+            filename = data.split(":", 1)[1]
+            _pending_actions[uid] = {"action": "env_add", "filename": filename}
+            bot.answer_callback_query(call.id)
+            bot.send_message(uid, f"🌍 <b>Add Env Variable for {filename}</b>\n\nSend in format:\n<code>KEY=VALUE</code>\n\nExample: <code>API_TOKEN=abc123</code>")
+
+        elif data.startswith("env_del:"):
+            parts = data.split(":", 2)
+            filename, key = parts[1], parts[2]
+            delete_env_var(uid, filename, key)
+            bot.answer_callback_query(call.id, f"🗑️ Deleted {key}")
+            env_vars = get_env_vars(uid, filename)
+            markup = env_menu_keyboard(filename, env_vars)
+            bot.edit_message_text(f"🌍 <b>Env Variables: {filename}</b>\n\nVariables: {len(env_vars)}", call.message.chat.id, call.message.message_id, reply_markup=markup)
+
+        elif data.startswith("env_clear:"):
+            filename = data.split(":", 1)[1]
+            delete_all_env_vars(uid, filename)
+            bot.answer_callback_query(call.id, "🗑️ All env vars cleared")
+            markup = env_menu_keyboard(filename, {})
+            bot.edit_message_text(f"🌍 <b>Env Variables: {filename}</b>\n\nAll variables cleared.", call.message.chat.id, call.message.message_id, reply_markup=markup)
+
+        # ── Cron Jobs ──────────────────────────────────────────────────────
+        elif data.startswith("cron_menu:"):
+            filename = data.split(":", 1)[1]
+            jobs = get_user_cron_jobs(uid)
+            job = next((j for j in jobs if j["filename"] == filename), None)
+            markup = cron_menu_keyboard(filename, job)
+            if job:
+                text = f"⏰ <b>Schedule: {filename}</b>\n\nCurrent: <code>{job['cron_expr']}</code>"
+            else:
+                text = f"⏰ <b>Schedule: {filename}</b>\n\nNo schedule set."
+            bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup)
+            bot.answer_callback_query(call.id)
+
+        elif data.startswith("cron_set:"):
+            parts = data.split(":", 2)
+            filename, cron_expr = parts[1], parts[2]
+            add_cron_job(uid, filename, cron_expr)
+            bot.answer_callback_query(call.id, "⏰ Schedule set!")
+            jobs = get_user_cron_jobs(uid)
+            job = next((j for j in jobs if j["filename"] == filename), None)
+            markup = cron_menu_keyboard(filename, job)
+            bot.edit_message_text(f"⏰ <b>Schedule: {filename}</b>\n\nSet to: <code>{cron_expr}</code>", call.message.chat.id, call.message.message_id, reply_markup=markup)
+
+        elif data.startswith("cron_add:"):
+            filename = data.split(":", 1)[1]
+            _pending_actions[uid] = {"action": "cron_add", "filename": filename}
+            bot.answer_callback_query(call.id)
+            bot.send_message(uid, f"⏰ <b>Set Schedule for {filename}</b>\n\nSend cron expression:\n<code>minute hour day month weekday</code>\n\nExamples:\n• <code>0 9 * * *</code> — Daily at 9:00 AM\n• <code>0 */6 * * *</code> — Every 6 hours\n• <code>30 8 * * 1</code> — Every Monday 8:30 AM")
+
+        elif data.startswith("cron_remove:"):
+            filename = data.split(":", 1)[1]
+            remove_cron_job(uid, filename)
+            bot.answer_callback_query(call.id, "🗑️ Schedule removed")
+            markup = cron_menu_keyboard(filename, None)
+            bot.edit_message_text(f"⏰ <b>Schedule: {filename}</b>\n\nSchedule removed.", call.message.chat.id, call.message.message_id, reply_markup=markup)
+
+        # ── Admin Coupons ──────────────────────────────────────────────────
+        elif data == "admin_coupons":
+            if not is_admin(uid):
+                bot.answer_callback_query(call.id, "🚫 Admin only")
+                return
+            coupons = get_all_coupons()
+            markup = coupon_list_keyboard(coupons)
+            bot.edit_message_text(f"🎫 <b>Coupons</b> ({len(coupons)} total)\n\nClick a coupon to delete it.", call.message.chat.id, call.message.message_id, reply_markup=markup)
+            bot.answer_callback_query(call.id)
+
+        elif data == "coupon_create":
+            if not is_admin(uid):
+                bot.answer_callback_query(call.id, "🚫 Admin only")
+                return
+            _pending_actions[uid] = {"action": "coupon_create"}
+            bot.answer_callback_query(call.id)
+            bot.send_message(uid, "🎫 <b>Create Coupon</b>\n\nSend in format:\n<code>CODE DAYS MAX_USES</code>\n\nExample: <code>PROMO2024 30 100</code>")
+
+        elif data.startswith("coupon_del:"):
+            if not is_admin(uid):
+                bot.answer_callback_query(call.id, "🚫 Admin only")
+                return
+            code = data.split(":", 1)[1]
+            delete_coupon(code)
+            bot.answer_callback_query(call.id, f"🗑️ Deleted {code}")
+            coupons = get_all_coupons()
+            markup = coupon_list_keyboard(coupons)
+            bot.edit_message_text(f"🎫 <b>Coupons</b> ({len(coupons)} total)", call.message.chat.id, call.message.message_id, reply_markup=markup)
+
     except Exception as e:
         bot.answer_callback_query(call.id, f"❌ Error: {str(e)[:50]}")
         try:
@@ -1008,6 +1162,56 @@ def handle_pending_action(message: Message):
         except ValueError:
             bot.reply_to(message, "❌ Invalid user ID.")
 
+    elif action == "env_add":
+        filename = action_data.get("filename")
+        text = message.text.strip()
+        if "=" not in text:
+            bot.reply_to(message, "❌ Format: KEY=VALUE")
+            return
+        key, value = text.split("=", 1)
+        key = key.strip().upper()
+        value = value.strip()
+        if not key:
+            bot.reply_to(message, "❌ Invalid key")
+            return
+        set_env_var(uid, filename, key, value)
+        bot.reply_to(message, f"✅ Saved: <code>{key}</code> = <code>{value}</code>")
+        env_vars = get_env_vars(uid, filename)
+        markup = env_menu_keyboard(filename, env_vars)
+        bot.send_message(uid, f"🌍 <b>Env Variables: {filename}</b>\n\nVariables: {len(env_vars)}", reply_markup=markup)
+
+    elif action == "cron_add":
+        filename = action_data.get("filename")
+        cron_expr = message.text.strip()
+        parts = cron_expr.split()
+        if len(parts) != 5:
+            bot.reply_to(message, "❌ Invalid cron expression. Must have 5 parts.\nExample: <code>0 9 * * *</code>")
+            return
+        add_cron_job(uid, filename, cron_expr)
+        bot.reply_to(message, f"⏰ Schedule set for <code>{filename}</code>: <code>{cron_expr}</code>")
+
+    elif action == "redeem_code":
+        code = message.text.strip()
+        ok, result = redeem_coupon(code, uid)
+        if not ok:
+            bot.reply_to(message, result)
+            return
+        set_premium(uid, result["days"])
+        bot.reply_to(message, f"🎉 <b>Coupon Redeemed!</b>\n💎 You got <b>{result['plan'].capitalize()}</b> for <b>{result['days']} days!</b>")
+
+    elif action == "coupon_create":
+        if not is_admin(uid):
+            return
+        parts = message.text.strip().split()
+        try:
+            code = parts[0].upper()
+            days = int(parts[1]) if len(parts) > 1 else 30
+            max_uses = int(parts[2]) if len(parts) > 2 else 1
+            ok, msg = create_coupon(code, "premium", days, max_uses)
+            bot.reply_to(message, f"{msg}\n🎫 Code: <code>{code}</code> | {days} days | {max_uses} uses")
+        except (ValueError, IndexError):
+            bot.reply_to(message, "❌ Format: CODE DAYS MAX_USES")
+
 @bot.message_handler(commands=["setwebuser"])
 def cmd_setwebuser(message):
     if message.from_user.id not in ADMIN_IDS:
@@ -1033,6 +1237,24 @@ def cmd_setwebpass(message):
     bot.reply_to(message, f"✅ Web password updated to: <code>{parts[1].strip()}</code>", parse_mode="HTML")
 
 @bot.message_handler(commands=["webcreds"])
+@bot.message_handler(commands=["portal"])
+def cmd_portal(message):
+    uid = message.from_user.id
+    db_user = get_user(uid)
+    if not db_user:
+        bot.reply_to(message, "❌ Please /start first.")
+        return
+    portal_url = "https://cloud-hosting-bot.onrender.com/portal?uid=" + str(uid)
+    bot.reply_to(
+        message,
+        "🌐 <b>Your Personal Portal</b>" + chr(10) + chr(10) + "Click the button below to view your files:",
+        parse_mode="HTML",
+        reply_markup=__import__('telebot').types.InlineKeyboardMarkup(
+            keyboard=[[__import__('telebot').types.InlineKeyboardButton("🚀 Open My Portal", url=portal_url)]]
+        )
+    )
+
+@bot.message_handler(commands=["webcreds"])
 def cmd_webcreds(message):
     if message.from_user.id not in ADMIN_IDS:
         return
@@ -1043,6 +1265,90 @@ def cmd_webcreds(message):
         '🌐 URL: https://cloud-hosting-bot.onrender.com/admin'
     ]
     bot.reply_to(message, chr(10).join(lines), parse_mode='HTML')
+
+@bot.message_handler(commands=["redeem"])
+def cmd_redeem(message: Message):
+    db_user = _require_user(message)
+    if not db_user:
+        return
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        bot.reply_to(message, "Usage: /redeem <code>\n\nExample: /redeem PROMO2024")
+        return
+    code = parts[1].strip()
+    ok, result = redeem_coupon(code, message.from_user.id)
+    if not ok:
+        bot.reply_to(message, result)
+        return
+    set_premium(message.from_user.id, result["days"])
+    bot.reply_to(message, f"🎉 <b>Coupon Redeemed!</b>\n💎 You got <b>{result['plan'].capitalize()}</b> for <b>{result['days']} days!</b>")
+
+@bot.message_handler(commands=["env"])
+def cmd_env(message: Message):
+    db_user = _require_user(message)
+    if not db_user:
+        return
+    uid = message.from_user.id
+    files = list_user_files(uid)
+    if not files:
+        bot.reply_to(message, "📭 No files found. Upload a file first.")
+        return
+    from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+    markup = InlineKeyboardMarkup(row_width=1)
+    for f in files[:10]:
+        markup.add(InlineKeyboardButton(f"🌍 {f['filename']}", callback_data=f"env_menu:{f['filename']}"))
+    bot.send_message(message.chat.id, "🌍 <b>Select file to manage env variables:</b>", reply_markup=markup)
+
+@bot.message_handler(commands=["cron"])
+def cmd_cron(message: Message):
+    db_user = _require_user(message)
+    if not db_user:
+        return
+    uid = message.from_user.id
+    jobs = get_user_cron_jobs(uid)
+    if not jobs:
+        bot.reply_to(message, "⏰ No scheduled jobs.\n\nUse file menu → ⏰ Schedule to add one.")
+        return
+    lines = ["⏰ <b>Your Scheduled Jobs:</b>\n"]
+    for j in jobs:
+        lines.append(f"📄 <code>{j['filename']}</code> → <code>{j['cron_expr']}</code>")
+    bot.reply_to(message, "\n".join(lines))
+
+@bot.message_handler(commands=["settings"])
+def cmd_settings(message: Message):
+    db_user = _require_user(message)
+    if not db_user:
+        return
+    uid = message.from_user.id
+    s = get_user_settings(uid)
+    from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+    markup = InlineKeyboardMarkup(row_width=1)
+    ar = "ON ✅" if s["auto_restart"] else "OFF ❌"
+    cn = "ON ✅" if s["crash_notify"] else "OFF ❌"
+    markup.add(
+        InlineKeyboardButton(f"♻️ Auto-Restart: {ar}", callback_data="setting_toggle_ar"),
+        InlineKeyboardButton(f"🔔 Crash Notify: {cn}", callback_data="setting_toggle_cn"),
+    )
+    text = (
+        f"⚙️ <b>Your Settings</b>\n\n"
+        f"♻️ Auto-Restart: <b>{ar}</b>\n"
+        f"🔔 Crash Notify: <b>{cn}</b>\n"
+        f"💻 CPU Limit: <b>{s['cpu_limit']}%</b>\n"
+        f"🧠 RAM Limit: <b>{s['ram_limit_mb']} MB</b>"
+    )
+    bot.reply_to(message, text, reply_markup=markup)
+
+@bot.message_handler(func=lambda m: m.text == "⚙️ Settings")
+def menu_settings(message: Message):
+    cmd_settings(message)
+
+@bot.message_handler(func=lambda m: m.text == "🎫 Redeem")
+def menu_redeem(message: Message):
+    db_user = _require_user(message)
+    if not db_user:
+        return
+    _pending_actions[message.from_user.id] = {"action": "redeem_code"}
+    bot.reply_to(message, "🎫 Send your coupon code:")
 
 def _background_tasks():
     while True:
@@ -1057,6 +1363,49 @@ def _background_tasks():
         except Exception:
             pass
         time.sleep(3600)
+
+def _run_cron_scheduler():
+    import re as _re
+    def _cron_matches(expr, now):
+        try:
+            parts = expr.split()
+            if len(parts) != 5:
+                return False
+            minute, hour, day, month, weekday = parts
+            def _match(field, val):
+                if field == "*":
+                    return True
+                if field.startswith("*/"):
+                    step = int(field[2:])
+                    return val % step == 0
+                return int(field) == val
+            return (_match(minute, now.minute) and _match(hour, now.hour) and
+                    _match(day, now.day) and _match(month, now.month) and
+                    _match(weekday, now.weekday()))
+        except Exception:
+            return False
+
+    while True:
+        try:
+            now = datetime.now()
+            jobs = get_all_cron_jobs()
+            for job in jobs:
+                if _cron_matches(job["cron_expr"], now):
+                    uid = job["user_id"]
+                    fname = job["filename"]
+                    db_user = get_user(uid)
+                    if db_user and not db_user.get("is_banned") and not is_running(uid, fname):
+                        plan = db_user.get("plan", "free")
+                        ok, msg = run_script(uid, fname, plan, bot_ref=bot)
+                        update_cron_last_run(job["id"])
+                        try:
+                            if ok:
+                                bot.send_message(uid, f"⏰ <b>Scheduled Run</b>\n📄 <code>{fname}</code> started automatically.")
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+        time.sleep(60)
 
 from web_panel import flask_app, get_web_username, get_web_password
 
@@ -1102,7 +1451,9 @@ if __name__ == "__main__":
     threading.Thread(target=run_flask, daemon=True).start()
     threading.Thread(target=_background_tasks, daemon=True).start()
     threading.Thread(target=run_daily_backup_scheduler, daemon=True).start()
+    threading.Thread(target=_run_cron_scheduler, daemon=True).start()
     print("📦 Daily backup scheduler started (sends at midnight)")
+    print("⏰ Cron scheduler started")
 
     print("✅ Bot is polling...")
     bot.infinity_polling(timeout=60, long_polling_timeout=30, skip_pending=True)
